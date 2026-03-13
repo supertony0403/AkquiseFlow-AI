@@ -37,7 +37,7 @@ Vertriebsteams und Agenturen sollen in Minuten qualifizierte Leads identifiziere
 ### 3.2 Scanner
 - URL-Eingabe mit Validierung
 - Optionen per Toggle: CVE-Check, DSGVO-Scan, KI-Analyse, Kontakte extrahieren, Deep Scan
-- **Echtzeit-Fortschritt:** Schritt-für-Schritt Status (Verbinde → Technologien → CVEs → KI → Fertig)
+- **Echtzeit-Fortschritt via Polling:** Frontend fragt `GET /api/scans/:id` alle 2 Sekunden ab bis `status === 'completed'` oder `'failed'`. Schritte werden anhand von `status` + `result`-Inhalt angezeigt (Verbinde → Technologien → CVEs → KI → Fertig). Kein WebSocket nötig.
 - **Ergebnis-Tabs:** Übersicht | Technologien | CVEs | DSGVO | Ansprechpartner | KI-Analyse
 - **Erkannte Technologien:** CMS, Framework, Server, Sprache, CDN, Analytics — jeweils mit Version + CVE-Count
 - **CVE-Liste:** ID, Beschreibung, CVSS-Score, Severity-Badge, betroffene Technologie
@@ -73,10 +73,10 @@ Integriert im Scanner-Ergebnis + Dashboard-Widget. Prüft:
 
 ### 3.6 Einstellungen
 - OpenRouter API Key + Modellauswahl
-- Brave Search API Key (Free Tier: 2.000 Req/Monat)
+- Brave Search API Key (Free Tier: 2.000 Req/Monat — UI zeigt Verbrauchswarnung ab 1.800)
 - NVD API Key (optional, erhöht Rate-Limit)
 - Scanner-Optionen: Timeout, Max. parallele Scans
-- MySQL Verbindungsdaten
+- **MySQL-Verbindungsdaten:** Werden in `.env` gespeichert, nicht in der DB selbst. Die Einstellungsseite zeigt nur den aktuellen Host/DB-Namen (read-only). Änderungen erfordern Neustart des Servers — das wird in der UI kommuniziert.
 - Über: Version, Lizenzen
 
 ---
@@ -95,7 +95,11 @@ Integriert im Scanner-Ergebnis + Dashboard-Widget. Prüft:
 | GET | `/api/settings` | Einstellungen lesen |
 | PUT | `/api/settings` | Einstellungen speichern |
 
-Bestehend (bereits implementiert): `/api/scans`, `/api/leads`, `/api/leads/search`
+| GET | `/api/leads/export` | CSV-Export aller/gefilterter Leads |
+
+Bestehend (bereits implementiert): `/api/scans`, `/api/leads`, `/api/leads/search`, `/api/leads/:id/contacts`
+
+**Hinweis Kontakte:** `GET /api/scans/:id/contacts` liest `contacts`-Feld aus dem `result`-JSON des Scans. `GET /api/leads/:id/contacts` liest aus der separaten `contacts`-Tabelle (für manuell verknüpfte Kontakte). Beide Endpoints bleiben erhalten — unterschiedliche Datenquellen.
 
 ---
 
@@ -147,7 +151,7 @@ checkDSGVO(html, url) → DSGVOResult {
 
 ```sql
 -- Neu: email_templates
-CREATE TABLE email_templates (
+CREATE TABLE IF NOT EXISTS email_templates (
   id VARCHAR(36) PRIMARY KEY,
   name VARCHAR(255) NOT NULL,
   subject VARCHAR(512),
@@ -156,29 +160,41 @@ CREATE TABLE email_templates (
   variables JSON,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-);
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
--- Erweiterung scans: contacts als JSON-Feld
-ALTER TABLE scans ADD COLUMN contacts JSON;
+-- Neu: settings (Key-Value-Store für API Keys etc.)
+CREATE TABLE IF NOT EXISTS settings (
+  `key` VARCHAR(128) PRIMARY KEY,
+  `value` TEXT,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
--- Erweiterung leads: contact_name, contact_email, contact_phone
-ALTER TABLE leads
-  ADD COLUMN contact_name VARCHAR(512),
-  ADD COLUMN contact_email VARCHAR(512),
-  ADD COLUMN contact_phone VARCHAR(128);
+-- Migration: contacts-Feld zu scans (idempotent)
+ALTER TABLE scans ADD COLUMN IF NOT EXISTS contacts JSON;
+
+-- Migration: Kontaktfelder zu leads (idempotent)
+ALTER TABLE leads ADD COLUMN IF NOT EXISTS contact_name VARCHAR(512);
+ALTER TABLE leads ADD COLUMN IF NOT EXISTS contact_email VARCHAR(512);
+ALTER TABLE leads ADD COLUMN IF NOT EXISTS contact_phone VARCHAR(128);
 ```
+
+Alle Migrationen werden in `initDB()` ausgeführt — `IF NOT EXISTS` / `ADD COLUMN IF NOT EXISTS` macht sie idempotent.
 
 ---
 
 ## 10. KI-Einsatz (OpenRouter)
 
-| Feature | Modell | Zweck |
+Alle Modellnamen verwenden das OpenRouter-Format `provider/model-name`:
+
+| Feature | Modell (OpenRouter-ID) | Zweck |
 |---------|--------|-------|
-| Website-Analyse | `claude-3.5-sonnet` | Zusammenfassung, Opportunities, Pitch |
-| Kontakt-Extraktion | `claude-3-haiku` | Schnell + günstig für HTML-Parsing |
-| E-Mail-Generierung | `claude-3.5-haiku` | Personalisierte Kaltakquise-Mail |
-| Lead-Scoring | `claude-3-haiku` | Score 0–100 basierend auf Schwachstellen |
+| Website-Analyse | `anthropic/claude-3.5-sonnet` | Zusammenfassung, Opportunities, Pitch |
+| Kontakt-Extraktion | `anthropic/claude-3-haiku` | Schnell + günstig für HTML-Parsing |
+| E-Mail-Generierung | `anthropic/claude-3.5-haiku` | Personalisierte Kaltakquise-Mail |
+| Lead-Scoring | `anthropic/claude-3-haiku` | Score 0–100 basierend auf Schwachstellen |
 | DSGVO-Bewertung | Regelbasiert | Kein KI-Einsatz nötig (deterministisch) |
+
+Standard-Modell konfigurierbar in `.env` und Einstellungsseite. Fallback auf `anthropic/claude-3-haiku` bei nicht konfiguriertem Key.
 
 ---
 
@@ -187,7 +203,12 @@ ALTER TABLE leads
 - Scanner nur für autorisierte Domains oder auf eigene Verantwortung
 - Rate-Limiting: 100 Requests/Minute (bereits implementiert)
 - Keine aggressiven Scan-Methoden (kein Port-Scanning, kein Brute-Force)
-- DSGVO-konformer Umgang mit extrahierten Kontaktdaten
+- **Kein Login-System** (lokales Single-User-Tool). API läuft nur auf `localhost` — kein öffentlicher Zugriff. `GET /api/settings` gibt Keys zurück, da das Tool nur lokal betrieben wird.
+- **SSL `rejectUnauthorized: false`** beim Scanner ist bewusst — nur für lokalen Betrieb, ermöglicht Scan von Domains mit ungültigen Certs.
+- **DSGVO-Hinweis für extrahierte Kontaktdaten:** UI zeigt Hinweistext "Kontaktdaten nur für einmalige Geschäftsanbahnung verwenden (Art. 6 Abs. 1 lit. f DSGVO)". Keine automatische Speicherlöschung in v1.
+- **DB-Migrationen:** `initDB()` führt `CREATE TABLE IF NOT EXISTS` aus. Neue Felder werden per `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` ergänzt — idempotent, sicher bei bereits bestehenden Instanzen.
+- **API Key-Speicherung:** Keys werden in der `settings`-Tabelle im Klartext gespeichert (lokale Installation, kein Multi-User-Betrieb). In der UI werden Keys als `password`-Inputs angezeigt.
+- **Input-Validierung:** Alle PUT/POST-Endpunkte validieren Typen und bereinigen Strings. URL-Inputs werden via `new URL()` geprüft.
 - Hinweis in UI: "Dieses Tool dient ausschließlich zur Akquise und darf nur für öffentlich erreichbare Websites genutzt werden."
 
 ---
